@@ -1,0 +1,42 @@
+# Default values for sonarqube-shard chart
+shardId: shard-default
+shardName: Default
+productTags:
+  - default
+
+sonarqube:
+  image: sonarqube:10.7-community
+  resources:
+    requests:
+      memory: 768Mi
+      cpu: 200m
+    limits:
+      memory: 2048Mi
+      cpu: 1500m
+
+postgresql:
+  image: postgres:15-alpine
+  password: sonar123
+  resources:
+    requests:
+      memory: 128Mi
+      cpu: 50m
+    limits:
+      memory: 384Mi
+      cpu: 500m
+
+storage:
+  className: ebs-gp3
+  sonarSize: 10Gi
+  pgSize: 10Gi
+
+service:
+  type: LoadBalancer
+  port: 9000
+
+tolerations:
+  - key: "CriticalAddonsOnly"
+    operator: "Exists"
+    effect: "NoSchedule"
+
+routerApiUrl: https://jtf0v97sdh.execute-api.us-east-1.amazonaws.com

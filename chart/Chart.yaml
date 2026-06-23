@@ -1,0 +1,5 @@
+apiVersion: v2
+name: sonarqube-shard
+description: Helm chart for a SonarQube shard (SonarQube CE + PostgreSQL sidecar)
+version: 1.0.0
+appVersion: "10.7.0"

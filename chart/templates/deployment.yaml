@@ -1,0 +1,107 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: sonar-{{ .Values.shardId }}
+  labels:
+    app: sonarqube
+    shard: {{ .Values.shardId | quote }}
+    product: {{ .Values.shardName | quote }}
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app: sonarqube
+      shard: {{ .Values.shardId | quote }}
+  template:
+    metadata:
+      labels:
+        app: sonarqube
+        shard: {{ .Values.shardId | quote }}
+        product: {{ .Values.shardName | quote }}
+    spec:
+      {{- if .Values.tolerations }}
+      tolerations:
+        {{- toYaml .Values.tolerations | nindent 8 }}
+      {{- end }}
+      initContainers:
+        - name: sysctl
+          image: busybox
+          command: ['sh', '-c', 'sysctl -w vm.max_map_count=524288 && sysctl -w fs.file-max=131072']
+          securityContext:
+            privileged: true
+        - name: fix-permissions
+          image: busybox
+          command: ['sh', '-c', 'chown -R 1000:1000 /opt/sonarqube/data && chown -R 1000:1000 /opt/sonarqube/extensions']
+          volumeMounts:
+            - name: sonar-data
+              mountPath: /opt/sonarqube/data
+            - name: sonar-data
+              mountPath: /opt/sonarqube/extensions
+              subPath: extensions
+          securityContext:
+            runAsUser: 0
+      containers:
+        - name: sonarqube
+          image: {{ .Values.sonarqube.image }}
+          ports:
+            - containerPort: 9000
+              name: http
+          env:
+            - name: SONAR_JDBC_URL
+              value: "jdbc:postgresql://localhost:5432/sonarqube"
+            - name: SONAR_JDBC_USERNAME
+              value: "sonarqube"
+            - name: SONAR_JDBC_PASSWORD
+              value: {{ .Values.postgresql.password | quote }}
+          resources:
+            {{- toYaml .Values.sonarqube.resources | nindent 12 }}
+          volumeMounts:
+            - name: sonar-data
+              mountPath: /opt/sonarqube/data
+            - name: sonar-data
+              mountPath: /opt/sonarqube/extensions
+              subPath: extensions
+          startupProbe:
+            httpGet:
+              path: /api/system/status
+              port: 9000
+            initialDelaySeconds: 30
+            periodSeconds: 10
+            failureThreshold: 30
+          readinessProbe:
+            httpGet:
+              path: /api/system/status
+              port: 9000
+            periodSeconds: 10
+          livenessProbe:
+            httpGet:
+              path: /api/system/status
+              port: 9000
+            periodSeconds: 30
+        - name: postgresql
+          image: {{ .Values.postgresql.image }}
+          ports:
+            - containerPort: 5432
+          env:
+            - name: POSTGRES_USER
+              value: "sonarqube"
+            - name: POSTGRES_PASSWORD
+              value: {{ .Values.postgresql.password | quote }}
+            - name: POSTGRES_DB
+              value: "sonarqube"
+            - name: PGDATA
+              value: "/var/lib/postgresql/data/pgdata"
+          resources:
+            {{- toYaml .Values.postgresql.resources | nindent 12 }}
+          volumeMounts:
+            - name: pg-data
+              mountPath: /var/lib/postgresql/data
+      volumes:
+        - name: sonar-data
+          persistentVolumeClaim:
+            claimName: sonar-{{ .Values.shardId }}-data
+        - name: pg-data
+          persistentVolumeClaim:
+            claimName: sonar-{{ .Values.shardId }}-pg-data
