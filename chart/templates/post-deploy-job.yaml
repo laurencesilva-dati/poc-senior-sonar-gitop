@@ -1,3 +1,38 @@
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: shard-configurator
+  annotations:
+    argocd.argoproj.io/hook: PostSync
+    argocd.argoproj.io/hook-delete-policy: BeforeHookCreation
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: shard-configurator-role
+  annotations:
+    argocd.argoproj.io/hook: PostSync
+    argocd.argoproj.io/hook-delete-policy: BeforeHookCreation
+rules:
+  - apiGroups: [""]
+    resources: ["services"]
+    verbs: ["get", "list"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: shard-configurator-binding
+  annotations:
+    argocd.argoproj.io/hook: PostSync
+    argocd.argoproj.io/hook-delete-policy: BeforeHookCreation
+subjects:
+  - kind: ServiceAccount
+    name: shard-configurator
+roleRef:
+  kind: Role
+  name: shard-configurator-role
+  apiGroup: rbac.authorization.k8s.io
+---
 apiVersion: batch/v1
 kind: Job
 metadata:
@@ -10,6 +45,7 @@ spec:
   backoffLimit: 5
   template:
     spec:
+      serviceAccountName: shard-configurator
       {{- if .Values.tolerations }}
       tolerations:
         {{- toYaml .Values.tolerations | nindent 8 }}
@@ -25,8 +61,8 @@ spec:
               SONAR_INTERNAL="http://sonar-{{ .Values.shardId }}.sonar-shards.svc.cluster.local:9000"
               ROUTER_API="{{ .Values.routerApiUrl }}"
               NEW_PASS="Laurence-123"
-              NAMESPACE="sonar-shards"
               SVC_NAME="sonar-{{ .Values.shardId }}"
+              NAMESPACE="sonar-shards"
               
               # 1. Aguardar SonarQube UP (max 5 min)
               echo "[1/5] Aguardando SonarQube..."
@@ -46,9 +82,9 @@ spec:
                 "$SONAR_INTERNAL/api/users/change_password" \
                 -d "login=admin&previousPassword=admin&password=$NEW_PASS")
               if [ "$RESP" = "204" ] || [ "$RESP" = "200" ]; then
-                echo "  Senha trocada para: $NEW_PASS"
+                echo "  Senha trocada com sucesso"
               else
-                echo "  Senha ja foi trocada anteriormente (status $RESP)"
+                echo "  Senha ja trocada anteriormente (status $RESP) - ok"
               fi
               
               # 3. Gerar token
@@ -58,36 +94,52 @@ spec:
                 "$SONAR_INTERNAL/api/user_tokens/generate" \
                 -d "name=router-token")
               TOKEN=$(echo "$TOKEN_RESP" | grep -o '"token":"[^"]*"' | cut -d'"' -f4)
-              echo "  Token: ${TOKEN:0:10}..."
+              if [ -n "$TOKEN" ]; then
+                echo "  Token gerado: ${TOKEN:0:10}..."
+              else
+                echo "  Token ja existe ou erro - continuando"
+                TOKEN=""
+              fi
               
-              # 4. Obter URL publica do LoadBalancer (via K8s API)
-              echo "[4/5] Obtendo URL do LoadBalancer..."
+              # 4. Obter URL PUBLICA do LoadBalancer (aguardar ate 3 min)
+              echo "[4/5] Aguardando URL publica do LoadBalancer..."
               K8S_TOKEN=$(cat /var/run/secrets/kubernetes.io/serviceaccount/token)
               K8S_CA=/var/run/secrets/kubernetes.io/serviceaccount/ca.crt
               EXTERNAL_URL=""
+              
               for i in $(seq 1 36); do
-                SVC_JSON=$(curl -s --cacert $K8S_CA -H "Authorization: Bearer $K8S_TOKEN" \
+                SVC_JSON=$(curl -s --cacert "$K8S_CA" \
+                  -H "Authorization: Bearer $K8S_TOKEN" \
                   "https://kubernetes.default.svc/api/v1/namespaces/$NAMESPACE/services/$SVC_NAME")
+                
                 HOSTNAME=$(echo "$SVC_JSON" | grep -o '"hostname":"[^"]*"' | head -1 | cut -d'"' -f4)
-                if [ -n "$HOSTNAME" ]; then
+                
+                if [ -n "$HOSTNAME" ] && [ "$HOSTNAME" != "null" ]; then
                   EXTERNAL_URL="http://${HOSTNAME}:9000"
-                  echo "  LB URL: $EXTERNAL_URL"
+                  echo "  URL do LoadBalancer: $EXTERNAL_URL"
                   break
                 fi
-                echo "  Aguardando LB... ($((i*5))s)"
+                
+                if [ $((i % 6)) -eq 0 ]; then
+                  echo "  Aguardando LB... ($((i*5))s)"
+                fi
                 sleep 5
               done
+              
               if [ -z "$EXTERNAL_URL" ]; then
-                echo "  AVISO: LB nao disponivel ainda, usando URL interna"
-                EXTERNAL_URL="$SONAR_INTERNAL"
+                echo "  ERRO: LoadBalancer nao ficou disponivel em 3 min!"
+                echo "  Job vai FALHAR e retry (backoffLimit=5)"
+                exit 1
               fi
               
-              # 5. Atualizar registro no Router: status PENDING -> READY
-              echo "[5/5] Marcando shard como READY no Router..."
-              curl -s -X PUT "$ROUTER_API/shards/{{ .Values.shardId }}/ready" \
+              # 5. Marcar shard como READY no Router (URL publica + token)
+              echo "[5/5] Registrando shard como READY (URL: $EXTERNAL_URL)..."
+              RESULT=$(curl -s -X PUT "$ROUTER_API/shards/{{ .Values.shardId }}/ready" \
                 -H "Content-Type: application/json" \
-                -d "{\"url\":\"$EXTERNAL_URL\",\"token\":\"$TOKEN\",\"name\":\"{{ .Values.shardName }}\",\"product_tags\":[{{- range $i, $t := .Values.productTags }}{{- if $i }},{{ end }}\"{{ $t }}\"{{- end }}]}"
+                -d "{\"url\":\"$EXTERNAL_URL\",\"token\":\"$TOKEN\",\"name\":\"{{ .Values.shardName }}\",\"product_tags\":[{{- range $i, $t := .Values.productTags }}{{- if $i }},{{ end }}\"{{ $t }}\"{{- end }}]}")
               
+              echo "  Router response: $RESULT"
               echo ""
-              echo "=== Shard {{ .Values.shardId }} configurado e READY! ==="
+              echo "=== Shard {{ .Values.shardId }} READY! ==="
               echo "  URL publica: $EXTERNAL_URL"
+              echo "  Notificacao enviada por email."
