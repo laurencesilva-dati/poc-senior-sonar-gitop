@@ -22,14 +22,16 @@ spec:
           args:
             - |
               echo "=== Configurando shard {{ .Values.shardId }} ==="
-              SONAR_URL="http://sonar-{{ .Values.shardId }}.sonar-shards.svc.cluster.local:9000"
+              SONAR_INTERNAL="http://sonar-{{ .Values.shardId }}.sonar-shards.svc.cluster.local:9000"
               ROUTER_API="{{ .Values.routerApiUrl }}"
               NEW_PASS="Laurence-123"
+              NAMESPACE="sonar-shards"
+              SVC_NAME="sonar-{{ .Values.shardId }}"
               
               # 1. Aguardar SonarQube UP (max 5 min)
               echo "[1/5] Aguardando SonarQube..."
               for i in $(seq 1 60); do
-                STATUS=$(curl -s -o /dev/null -w "%{http_code}" "$SONAR_URL/api/system/status")
+                STATUS=$(curl -s -o /dev/null -w "%{http_code}" "$SONAR_INTERNAL/api/system/status")
                 if [ "$STATUS" = "200" ]; then
                   echo "  SonarQube UP!"
                   break
@@ -41,7 +43,7 @@ spec:
               echo "[2/5] Trocando senha admin..."
               RESP=$(curl -s -o /dev/null -w "%{http_code}" -X POST \
                 -u admin:admin \
-                "$SONAR_URL/api/users/change_password" \
+                "$SONAR_INTERNAL/api/users/change_password" \
                 -d "login=admin&previousPassword=admin&password=$NEW_PASS")
               if [ "$RESP" = "204" ] || [ "$RESP" = "200" ]; then
                 echo "  Senha trocada para: $NEW_PASS"
@@ -53,17 +55,34 @@ spec:
               echo "[3/5] Gerando token de API..."
               TOKEN_RESP=$(curl -s -X POST \
                 -u "admin:$NEW_PASS" \
-                "$SONAR_URL/api/user_tokens/generate" \
+                "$SONAR_INTERNAL/api/user_tokens/generate" \
                 -d "name=router-token")
               TOKEN=$(echo "$TOKEN_RESP" | grep -o '"token":"[^"]*"' | cut -d'"' -f4)
               echo "  Token: ${TOKEN:0:10}..."
               
-              # 4. Obter URL do LoadBalancer
-              echo "[4/5] Aguardando LoadBalancer..."
-              # Usar a URL interna por enquanto - o LB pode demorar
-              EXTERNAL_URL="$SONAR_URL"
+              # 4. Obter URL publica do LoadBalancer (via K8s API)
+              echo "[4/5] Obtendo URL do LoadBalancer..."
+              K8S_TOKEN=$(cat /var/run/secrets/kubernetes.io/serviceaccount/token)
+              K8S_CA=/var/run/secrets/kubernetes.io/serviceaccount/ca.crt
+              EXTERNAL_URL=""
+              for i in $(seq 1 36); do
+                SVC_JSON=$(curl -s --cacert $K8S_CA -H "Authorization: Bearer $K8S_TOKEN" \
+                  "https://kubernetes.default.svc/api/v1/namespaces/$NAMESPACE/services/$SVC_NAME")
+                HOSTNAME=$(echo "$SVC_JSON" | grep -o '"hostname":"[^"]*"' | head -1 | cut -d'"' -f4)
+                if [ -n "$HOSTNAME" ]; then
+                  EXTERNAL_URL="http://${HOSTNAME}:9000"
+                  echo "  LB URL: $EXTERNAL_URL"
+                  break
+                fi
+                echo "  Aguardando LB... ($((i*5))s)"
+                sleep 5
+              done
+              if [ -z "$EXTERNAL_URL" ]; then
+                echo "  AVISO: LB nao disponivel ainda, usando URL interna"
+                EXTERNAL_URL="$SONAR_INTERNAL"
+              fi
               
-              # 5. Atualizar registro no Router com URL real + token
+              # 5. Atualizar registro no Router com URL publica + token
               echo "[5/5] Atualizando registro no Router..."
               curl -s -X POST "$ROUTER_API/shards" \
                 -H "Content-Type: application/json" \
@@ -71,3 +90,4 @@ spec:
               
               echo ""
               echo "=== Shard {{ .Values.shardId }} configurado! ==="
+              echo "  URL publica: $EXTERNAL_URL"
