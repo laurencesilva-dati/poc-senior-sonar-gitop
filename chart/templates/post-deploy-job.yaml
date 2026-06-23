@@ -41,7 +41,7 @@ metadata:
     argocd.argoproj.io/hook: PostSync
     argocd.argoproj.io/hook-delete-policy: BeforeHookCreation
 spec:
-  ttlSecondsAfterFinished: 300
+  ttlSecondsAfterFinished: 120
   backoffLimit: 5
   template:
     spec:
@@ -53,93 +53,62 @@ spec:
       restartPolicy: OnFailure
       containers:
         - name: configurator
-          image: curlimages/curl:8.5.0
+          image: bitnami/kubectl:1.30
           command: ["/bin/sh", "-c"]
           args:
             - |
               echo "=== Configurando shard {{ .Values.shardId }} ==="
-              SONAR_INTERNAL="http://sonar-{{ .Values.shardId }}.sonar-shards.svc.cluster.local:9000"
+              SONAR_URL="http://sonar-{{ .Values.shardId }}.sonar-shards.svc.cluster.local:9000"
               ROUTER_API="{{ .Values.routerApiUrl }}"
               NEW_PASS="Laurence-123"
               SVC_NAME="sonar-{{ .Values.shardId }}"
               NAMESPACE="sonar-shards"
-              
-              # 1. Aguardar SonarQube UP (max 5 min)
+
+              # 1. Aguardar SonarQube UP
               echo "[1/5] Aguardando SonarQube..."
-              for i in $(seq 1 60); do
-                STATUS=$(curl -s -o /dev/null -w "%{http_code}" "$SONAR_INTERNAL/api/system/status")
-                if [ "$STATUS" = "200" ]; then
-                  echo "  SonarQube UP!"
-                  break
-                fi
+              until wget -qO- "$SONAR_URL/api/system/status" 2>/dev/null | grep -q '"status":"UP"'; do
                 sleep 5
               done
-              
+              echo "  SonarQube UP!"
+
               # 2. Trocar senha admin
               echo "[2/5] Trocando senha admin..."
-              RESP=$(curl -s -o /dev/null -w "%{http_code}" -X POST \
-                -u admin:admin \
-                "$SONAR_INTERNAL/api/users/change_password" \
-                -d "login=admin&previousPassword=admin&password=$NEW_PASS")
-              if [ "$RESP" = "204" ] || [ "$RESP" = "200" ]; then
-                echo "  Senha trocada com sucesso"
-              else
-                echo "  Senha ja trocada anteriormente (status $RESP) - ok"
-              fi
-              
+              wget -qO- --post-data="login=admin&previousPassword=admin&password=$NEW_PASS" \
+                --header="Authorization: Basic YWRtaW46YWRtaW4=" \
+                "$SONAR_URL/api/users/change_password" 2>/dev/null || echo "  (senha ja trocada)"
+
               # 3. Gerar token
-              echo "[3/5] Gerando token de API..."
-              TOKEN_RESP=$(curl -s -X POST \
-                -u "admin:$NEW_PASS" \
-                "$SONAR_INTERNAL/api/user_tokens/generate" \
-                -d "name=router-token")
-              TOKEN=$(echo "$TOKEN_RESP" | grep -o '"token":"[^"]*"' | cut -d'"' -f4)
-              if [ -n "$TOKEN" ]; then
-                echo "  Token gerado: ${TOKEN:0:10}..."
-              else
-                echo "  Token ja existe ou erro - continuando"
-                TOKEN=""
-              fi
-              
-              # 4. Obter URL PUBLICA do LoadBalancer (aguardar ate 3 min)
-              echo "[4/5] Aguardando URL publica do LoadBalancer..."
-              K8S_TOKEN=$(cat /var/run/secrets/kubernetes.io/serviceaccount/token)
-              K8S_CA=/var/run/secrets/kubernetes.io/serviceaccount/ca.crt
-              EXTERNAL_URL=""
-              
+              echo "[3/5] Gerando token..."
+              TOKEN=$(wget -qO- --post-data="name=router-token" \
+                --header="Authorization: Basic YWRtaW46TGF1cmVuY2UtMTIz" \
+                "$SONAR_URL/api/user_tokens/generate" 2>/dev/null | grep -o '"token":"[^"]*"' | cut -d'"' -f4)
+              echo "  Token: ${TOKEN:0:10}..."
+
+              # 4. Obter URL do LoadBalancer via kubectl (simples e confiavel)
+              echo "[4/5] Obtendo URL do LoadBalancer..."
+              LB_HOST=""
               for i in $(seq 1 36); do
-                SVC_JSON=$(curl -s --cacert "$K8S_CA" \
-                  -H "Authorization: Bearer $K8S_TOKEN" \
-                  "https://kubernetes.default.svc/api/v1/namespaces/$NAMESPACE/services/$SVC_NAME")
-                
-                HOSTNAME=$(echo "$SVC_JSON" | grep -o '"hostname" *: *"[^"]*"' | head -1 | sed 's/.*: *"\(.*\)"/\1/')
-                
-                if [ -n "$HOSTNAME" ] && [ "$HOSTNAME" != "null" ]; then
-                  EXTERNAL_URL="http://${HOSTNAME}:9000"
-                  echo "  URL do LoadBalancer: $EXTERNAL_URL"
+                LB_HOST=$(kubectl get svc $SVC_NAME -n $NAMESPACE -o jsonpath='{.status.loadBalancer.ingress[0].hostname}' 2>/dev/null)
+                if [ -n "$LB_HOST" ]; then
+                  echo "  LB: $LB_HOST"
                   break
                 fi
-                
-                if [ $((i % 6)) -eq 0 ]; then
-                  echo "  Aguardando LB... ($((i*5))s)"
-                fi
+                echo "  Aguardando LB... ($((i*5))s)"
                 sleep 5
               done
-              
-              if [ -z "$EXTERNAL_URL" ]; then
-                echo "  ERRO: LoadBalancer nao ficou disponivel em 3 min!"
-                echo "  Job vai FALHAR e retry (backoffLimit=5)"
+
+              if [ -z "$LB_HOST" ]; then
+                echo "  ERRO: LB nao ficou pronto em 3 min. Retentando..."
                 exit 1
               fi
-              
-              # 5. Marcar shard como READY no Router (URL publica + token)
-              echo "[5/5] Registrando shard como READY (URL: $EXTERNAL_URL)..."
-              RESULT=$(curl -s -X PUT "$ROUTER_API/shards/{{ .Values.shardId }}/ready" \
-                -H "Content-Type: application/json" \
-                -d "{\"url\":\"$EXTERNAL_URL\",\"token\":\"$TOKEN\",\"name\":\"{{ .Values.shardName }}\",\"product_tags\":[{{- range $i, $t := .Values.productTags }}{{- if $i }},{{ end }}\"{{ $t }}\"{{- end }}]}")
-              
-              echo "  Router response: $RESULT"
+
+              EXTERNAL_URL="http://${LB_HOST}:9000"
+
+              # 5. Registrar como READY no Router
+              echo "[5/5] Registrando como READY: $EXTERNAL_URL"
+              wget -qO- --post-data="{\"url\":\"$EXTERNAL_URL\",\"token\":\"$TOKEN\",\"name\":\"{{ .Values.shardName }}\",\"product_tags\":[{{- range $i, $t := .Values.productTags }}{{- if $i }},{{ end }}\"{{ $t }}\"{{- end }}]}" \
+                --header="Content-Type: application/json" \
+                "$ROUTER_API/shards/{{ .Values.shardId }}/ready" 2>/dev/null
+
               echo ""
-              echo "=== Shard {{ .Values.shardId }} READY! ==="
-              echo "  URL publica: $EXTERNAL_URL"
-              echo "  Notificacao enviada por email."
+              echo "=== DONE: {{ .Values.shardId }} READY at $EXTERNAL_URL ==="
