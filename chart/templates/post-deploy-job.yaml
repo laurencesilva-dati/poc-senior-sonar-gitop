@@ -112,7 +112,7 @@ spec:
                   -H "Authorization: Bearer $K8S_TOKEN" \
                   "https://kubernetes.default.svc/api/v1/namespaces/$NAMESPACE/services/$SVC_NAME")
                 
-                HOSTNAME=$(echo "$SVC_JSON" | grep -o '"hostname":"[^"]*"' | head -1 | cut -d'"' -f4)
+                HOSTNAME=$(echo "$SVC_JSON" | grep -o '"hostname" *: *"[^"]*"' | head -1 | sed 's/.*: *"\(.*\)"/\1/')
                 
                 if [ -n "$HOSTNAME" ] && [ "$HOSTNAME" != "null" ]; then
                   EXTERNAL_URL="http://${HOSTNAME}:9000"
