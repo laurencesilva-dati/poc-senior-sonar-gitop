@@ -82,12 +82,12 @@ spec:
                 EXTERNAL_URL="$SONAR_INTERNAL"
               fi
               
-              # 5. Atualizar registro no Router com URL publica + token
-              echo "[5/5] Atualizando registro no Router..."
-              curl -s -X POST "$ROUTER_API/shards" \
+              # 5. Atualizar registro no Router: status PENDING -> READY
+              echo "[5/5] Marcando shard como READY no Router..."
+              curl -s -X PUT "$ROUTER_API/shards/{{ .Values.shardId }}/ready" \
                 -H "Content-Type: application/json" \
-                -d "{\"shard_id\":\"{{ .Values.shardId }}\",\"name\":\"{{ .Values.shardName }}\",\"url\":\"$EXTERNAL_URL\",\"token\":\"$TOKEN\",\"product_tags\":[{{- range $i, $t := .Values.productTags }}{{- if $i }},{{ end }}\"{{ $t }}\"{{- end }}],\"version\":\"10.7.0\"}"
+                -d "{\"url\":\"$EXTERNAL_URL\",\"token\":\"$TOKEN\",\"name\":\"{{ .Values.shardName }}\",\"product_tags\":[{{- range $i, $t := .Values.productTags }}{{- if $i }},{{ end }}\"{{ $t }}\"{{- end }}]}"
               
               echo ""
-              echo "=== Shard {{ .Values.shardId }} configurado! ==="
+              echo "=== Shard {{ .Values.shardId }} configurado e READY! ==="
               echo "  URL publica: $EXTERNAL_URL"
