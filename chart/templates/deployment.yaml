@@ -25,6 +25,8 @@ spec:
       tolerations:
         {{- toYaml .Values.tolerations | nindent 8 }}
       {{- end }}
+      nodeSelector:
+        karpenter.sh/nodepool: sonarshard
       initContainers:
         - name: sysctl
           image: busybox
