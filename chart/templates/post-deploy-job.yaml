@@ -1,0 +1,73 @@
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: configure-{{ .Values.shardId }}
+  annotations:
+    argocd.argoproj.io/hook: PostSync
+    argocd.argoproj.io/hook-delete-policy: BeforeHookCreation
+spec:
+  ttlSecondsAfterFinished: 300
+  backoffLimit: 5
+  template:
+    spec:
+      {{- if .Values.tolerations }}
+      tolerations:
+        {{- toYaml .Values.tolerations | nindent 8 }}
+      {{- end }}
+      restartPolicy: OnFailure
+      containers:
+        - name: configurator
+          image: curlimages/curl:8.5.0
+          command: ["/bin/sh", "-c"]
+          args:
+            - |
+              echo "=== Configurando shard {{ .Values.shardId }} ==="
+              SONAR_URL="http://sonar-{{ .Values.shardId }}.sonar-shards.svc.cluster.local:9000"
+              ROUTER_API="{{ .Values.routerApiUrl }}"
+              NEW_PASS="Laurence-123"
+              
+              # 1. Aguardar SonarQube UP (max 5 min)
+              echo "[1/5] Aguardando SonarQube..."
+              for i in $(seq 1 60); do
+                STATUS=$(curl -s -o /dev/null -w "%{http_code}" "$SONAR_URL/api/system/status")
+                if [ "$STATUS" = "200" ]; then
+                  echo "  SonarQube UP!"
+                  break
+                fi
+                sleep 5
+              done
+              
+              # 2. Trocar senha admin
+              echo "[2/5] Trocando senha admin..."
+              RESP=$(curl -s -o /dev/null -w "%{http_code}" -X POST \
+                -u admin:admin \
+                "$SONAR_URL/api/users/change_password" \
+                -d "login=admin&previousPassword=admin&password=$NEW_PASS")
+              if [ "$RESP" = "204" ] || [ "$RESP" = "200" ]; then
+                echo "  Senha trocada para: $NEW_PASS"
+              else
+                echo "  Senha ja foi trocada anteriormente (status $RESP)"
+              fi
+              
+              # 3. Gerar token
+              echo "[3/5] Gerando token de API..."
+              TOKEN_RESP=$(curl -s -X POST \
+                -u "admin:$NEW_PASS" \
+                "$SONAR_URL/api/user_tokens/generate" \
+                -d "name=router-token")
+              TOKEN=$(echo "$TOKEN_RESP" | grep -o '"token":"[^"]*"' | cut -d'"' -f4)
+              echo "  Token: ${TOKEN:0:10}..."
+              
+              # 4. Obter URL do LoadBalancer
+              echo "[4/5] Aguardando LoadBalancer..."
+              # Usar a URL interna por enquanto - o LB pode demorar
+              EXTERNAL_URL="$SONAR_URL"
+              
+              # 5. Atualizar registro no Router com URL real + token
+              echo "[5/5] Atualizando registro no Router..."
+              curl -s -X POST "$ROUTER_API/shards" \
+                -H "Content-Type: application/json" \
+                -d "{\"shard_id\":\"{{ .Values.shardId }}\",\"name\":\"{{ .Values.shardName }}\",\"url\":\"$EXTERNAL_URL\",\"token\":\"$TOKEN\",\"product_tags\":[{{- range $i, $t := .Values.productTags }}{{- if $i }},{{ end }}\"{{ $t }}\"{{- end }}],\"version\":\"10.7.0\"}"
+              
+              echo ""
+              echo "=== Shard {{ .Values.shardId }} configurado! ==="
